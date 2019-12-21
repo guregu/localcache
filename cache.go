@@ -90,10 +90,48 @@ func (c *Cache) setScan(table, key string, v interface{}) {
 	c.scans.Set(table, key, v, 5*time.Minute)
 }
 
-func (c *Cache) invalidate(table string) {
-	c.log("deleting query/scan cache", table)
-	c.queries.DeleteAll(table)
+func (c *Cache) invalidate(table string, item map[string]*dynamodb.AttributeValue) {
+	desc, err := c.desc(table)
+	if err != nil {
+		panic(err)
+	}
 	c.scans.DeleteAll(table)
+	if len(desc.Table.KeySchema) == 1 {
+		c.queries.DeleteAll(table)
+	} else {
+		key := tableHashKey(table, av2str(item[*desc.Table.KeySchema[0].AttributeName]), "")
+		c.log("invalidate", key)
+		c.queries.DeleteAll(key)
+	}
+	for _, gsi := range desc.Table.GlobalSecondaryIndexes {
+		if len(gsi.KeySchema) == 1 {
+			key := tableHashKey(table, "", *gsi.IndexName)
+			c.log("invalidate", key)
+			c.queries.DeleteAll(key)
+		} else if hk, ok := item[*gsi.KeySchema[0].AttributeName]; ok {
+			key := tableHashKey(table, av2str(hk), *gsi.IndexName)
+			c.log("invalidate", key)
+			c.queries.DeleteAll(key)
+		}
+	}
+	for _, lsi := range desc.Table.LocalSecondaryIndexes {
+		if hk, ok := item[*lsi.KeySchema[0].AttributeName]; ok {
+			key := tableHashKey(table, av2str(hk), *lsi.IndexName)
+			c.log("invalidate", key)
+			c.queries.DeleteAll(key)
+		}
+	}
+}
+
+func tableHashKey(table, hk, idx string) string {
+	key := table
+	if hk != "" {
+		key += "&" + hk
+	}
+	if idx != "" {
+		key += "#" + idx
+	}
+	return key
 }
 
 func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput, opts ...request.Option) (*dynamodb.GetItemOutput, error) {
@@ -131,7 +169,7 @@ func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput
 	}
 	c.log("caching put", key)
 	c.setItem(key, input.Item)
-	c.invalidate(*input.TableName)
+	c.invalidate(*input.TableName, input.Item)
 	return out, err
 }
 
@@ -148,7 +186,7 @@ func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteIte
 
 	key := itemKey(*input.TableName, input.Key, schema)
 	c.deleteItem(key)
-	c.invalidate(*input.TableName)
+	c.invalidate(*input.TableName, input.Key)
 	c.log("deleting cached", key)
 
 	return out, err
@@ -174,11 +212,13 @@ func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateIte
 	if input.ReturnValues != nil && *input.ReturnValues == dynamodb.ReturnValueAllNew {
 		c.log("cache updated", key)
 		c.setItem(key, out.Attributes)
+		c.invalidate(*input.TableName, out.Attributes)
 	} else {
 		c.log("delete updated", key)
 		c.deleteItem(key)
+		// TODO: this could miss invalidating an index...
+		c.invalidate(*input.TableName, input.Key)
 	}
-	c.invalidate(*input.TableName)
 	return out, err
 }
 
@@ -256,7 +296,6 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 		return out, err
 	}
 	for table, reqs := range input.RequestItems {
-		c.invalidate(table)
 		schema, err := c.schemaOf(table)
 		if err != nil {
 			// TODO: probably bad to error out here
@@ -276,6 +315,7 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 				key := itemKey(table, req.DeleteRequest.Key, schema)
 				c.log("batch delete", key)
 				c.deleteItem(key)
+				c.invalidate(table, req.DeleteRequest.Key)
 			} else if req.PutRequest != nil {
 				for _, unprocessed := range out.UnprocessedItems[table] {
 					if unprocessed.PutRequest == nil {
@@ -288,6 +328,7 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 				key := itemKey(table, req.PutRequest.Item, schema)
 				c.log("batch put", key)
 				c.setItem(key, req.PutRequest.Item)
+				c.invalidate(table, req.PutRequest.Item)
 			}
 		}
 	}
@@ -309,7 +350,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Put.TableName, req.Put.Item, schema)
 			c.log("transact put", key)
 			c.setItem(key, req.Put.Item)
-			c.invalidate(*req.Put.TableName)
+			c.invalidate(*req.Put.TableName, req.Put.Item)
 		case req.Delete != nil:
 			schema, err := c.schemaOf(*req.Delete.TableName)
 			if err != nil {
@@ -318,7 +359,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Delete.TableName, req.Delete.Key, schema)
 			c.log("transact delete", key)
 			c.deleteItem(key)
-			c.invalidate(*req.Delete.TableName)
+			c.invalidate(*req.Delete.TableName, req.Delete.Key)
 		case req.Update != nil:
 			schema, err := c.schemaOf(*req.Update.TableName)
 			if err != nil {
@@ -327,7 +368,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Update.TableName, req.Update.Key, schema)
 			c.log("transact update", key)
 			c.deleteItem(key)
-			c.invalidate(*req.Update.TableName)
+			c.invalidate(*req.Update.TableName, req.Update.Key)
 		}
 	}
 	return out, err
@@ -335,21 +376,27 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 
 func (c *Cache) QueryWithContext(ctx aws.Context, input *dynamodb.QueryInput, opts ...request.Option) (*dynamodb.QueryOutput, error) {
 	// spew.Dump(input)
-
+	var idx string
 	var schema []*dynamodb.KeySchemaElement
 	var err error
 	if input.IndexName == nil {
 		schema, err = c.schemaOf(*input.TableName)
 	} else {
 		schema, err = c.schemaOfIndex(*input.TableName, *input.IndexName)
+		idx = *input.IndexName
 	}
 	if err != nil {
 		return nil, err
 	}
-
+	var tkey string
+	if len(schema) == 1 {
+		tkey = tableHashKey(*input.TableName, "", idx)
+	} else {
+		tkey = tableHashKey(*input.TableName, av2str(input.KeyConditions[*schema[0].AttributeName].AttributeValueList[0]), idx)
+	}
 	key := queryKey(input, schema)
-	if out, ok := c.getQuery(*input.TableName, key); ok {
-		c.log("cached query:", key)
+	if out, ok := c.getQuery(tkey, key); ok {
+		c.log("cached query:", tkey, key)
 		return out.(*dynamodb.QueryOutput), nil
 	}
 
@@ -357,15 +404,17 @@ func (c *Cache) QueryWithContext(ctx aws.Context, input *dynamodb.QueryInput, op
 	if err != nil {
 		return out, err
 	}
-	c.log("saving query:", key)
-	c.setQuery(*input.TableName, key, out)
+	c.log("saving query:", tkey, key)
+	c.setQuery(tkey, key, out)
 	return out, err
 }
 
 func queryKey(input *dynamodb.QueryInput, schema []*dynamodb.KeySchemaElement) string {
 	var key string
 	if input.Select != nil {
-		key += *input.Select
+		key = *input.Select
+	} else {
+		key = "*"
 	}
 	if input.ScanIndexForward == nil || (input.ScanIndexForward != nil && *input.ScanIndexForward == true) {
 		key += ".f "
