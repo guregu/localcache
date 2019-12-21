@@ -23,30 +23,65 @@ func NewWithDB(client *dynamodb.DynamoDB) dynamodbiface.DynamoDBAPI {
 	return &Cache{
 		DynamoDB: client,
 
-		getItem: cache.New(5*time.Minute, 10*time.Minute),
+		items:     cache.New(5*time.Minute, 10*time.Minute),
+		tableDesc: cache.New(cache.NoExpiration, cache.NoExpiration),
 	}
 }
 
 type Cache struct {
 	*dynamodb.DynamoDB
-	getItem *cache.Cache
+	items     *cache.Cache
+	tableDesc *cache.Cache
 }
 
 func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput, opts ...request.Option) (*dynamodb.GetItemOutput, error) {
 	// spew.Dump(input)
 	key := *input.TableName + "$" + key2str(input.Key)
 	// key := fmt.Sprintf("%s %v"), *input.TableName, *input.)
-	if out, ok := c.getItem.Get(key); ok {
+	if item, ok := c.items.Get(key); ok {
 		log.Print("returning cached", key)
-		return out.(*dynamodb.GetItemOutput), nil
+		return &dynamodb.GetItemOutput{
+			Item: item.(map[string]*dynamodb.AttributeValue),
+		}, nil
 	}
 	out, err := c.DynamoDB.GetItemWithContext(ctx, input, opts...)
 	if err != nil {
 		return out, err
 	}
 	log.Print("caching", key)
-	c.getItem.Set(key, out, cache.DefaultExpiration)
+	c.items.Set(key, out.Item, cache.DefaultExpiration)
 	return out, err
+}
+
+func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput, opts ...request.Option) (*dynamodb.PutItemOutput, error) {
+	desc, ok := c.tableDesc.Get(*input.TableName)
+	if !ok {
+		out, err := c.DynamoDB.DescribeTable(&dynamodb.DescribeTableInput{TableName: input.TableName})
+		if err != nil {
+			return nil, err
+		}
+		c.tableDesc.Set(*input.TableName, out, cache.DefaultExpiration)
+		log.Println("caching desc", out)
+		desc = out
+	}
+	schema := desc.(*dynamodb.DescribeTableOutput).Table.KeySchema
+	key := putKey(*input.TableName, input.Item, schema)
+
+	out, err := c.DynamoDB.PutItemWithContext(ctx, input, opts...)
+	if err != nil {
+		return out, err
+	}
+	log.Println("caching put", key)
+	c.items.Set(key, input.Item, cache.DefaultExpiration)
+	return out, err
+}
+
+func putKey(table string, item map[string]*dynamodb.AttributeValue, schema []*dynamodb.KeySchemaElement) string {
+	key := table + "$" + *schema[0].AttributeName + ":" + av2str(item[*schema[0].AttributeName])
+	if len(schema) > 1 {
+		key += "/" + *schema[1].AttributeName + ":" + av2str(item[*schema[1].AttributeName])
+	}
+	return key
 }
 
 func key2str(key map[string]*dynamodb.AttributeValue) string {
