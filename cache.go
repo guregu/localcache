@@ -2,7 +2,10 @@ package localcache
 
 import (
 	"bytes"
+	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -10,8 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
-	// "github.com/patrickmn/go-cache"
 	"github.com/karlseguin/ccache"
+	// "github.com/davecgh/go-spew/spew"
 )
 
 func New(p client.ConfigProvider, cfgs ...*aws.Config) dynamodbiface.DynamoDBAPI {
@@ -25,13 +28,16 @@ func NewWithDB(client *dynamodb.DynamoDB) dynamodbiface.DynamoDBAPI {
 
 		items:     ccache.New(ccache.Configure()),
 		tableDesc: ccache.New(ccache.Configure()),
+		queries:   ccache.Layered(ccache.Configure()),
 	}
 }
 
 type Cache struct {
 	*dynamodb.DynamoDB
+
 	items     *ccache.Cache
 	tableDesc *ccache.Cache
+	queries   *ccache.LayeredCache
 
 	Debug bool
 }
@@ -56,6 +62,23 @@ func (c *Cache) setItem(key string, v interface{}) {
 
 func (c *Cache) deleteItem(key string) {
 	c.items.Delete(key)
+}
+
+func (c *Cache) getQuery(table, key string) (interface{}, bool) {
+	item := c.queries.Get(table, key)
+	if item == nil {
+		return nil, false
+	}
+	return item.Value(), true
+}
+
+func (c *Cache) setQuery(table, key string, v interface{}) {
+	c.queries.Set(table, key, v, 5*time.Minute)
+}
+
+func (c *Cache) deleteQueries(table string) {
+	c.log("deleting query cache", table)
+	c.queries.DeleteAll(table)
 }
 
 func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput, opts ...request.Option) (*dynamodb.GetItemOutput, error) {
@@ -93,6 +116,7 @@ func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput
 	}
 	c.log("caching put", key)
 	c.setItem(key, input.Item)
+	c.deleteQueries(*input.TableName)
 	return out, err
 }
 
@@ -109,6 +133,7 @@ func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteIte
 
 	key := itemKey(*input.TableName, input.Key, schema)
 	c.deleteItem(key)
+	c.deleteQueries(*input.TableName)
 	c.log("deleting cached", key)
 
 	return out, err
@@ -138,6 +163,7 @@ func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateIte
 		c.log("delete updated", key)
 		c.deleteItem(key)
 	}
+	c.deleteQueries(*input.TableName)
 	return out, err
 }
 
@@ -215,6 +241,7 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 		return out, err
 	}
 	for table, reqs := range input.RequestItems {
+		c.deleteQueries(table)
 		schema, err := c.schemaOf(table)
 		if err != nil {
 			// TODO: probably bad to error out here
@@ -267,6 +294,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Put.TableName, req.Put.Item, schema)
 			c.log("transact put", key)
 			c.setItem(key, req.Put.Item)
+			c.deleteQueries(*req.Put.TableName)
 		case req.Delete != nil:
 			schema, err := c.schemaOf(*req.Delete.TableName)
 			if err != nil {
@@ -275,6 +303,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Delete.TableName, req.Delete.Key, schema)
 			c.log("transact delete", key)
 			c.deleteItem(key)
+			c.deleteQueries(*req.Delete.TableName)
 		case req.Update != nil:
 			schema, err := c.schemaOf(*req.Update.TableName)
 			if err != nil {
@@ -283,26 +312,143 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Update.TableName, req.Update.Key, schema)
 			c.log("transact update", key)
 			c.deleteItem(key)
+			c.deleteQueries(*req.Update.TableName)
 		}
 	}
 	return out, err
 }
 
+func (c *Cache) QueryWithContext(ctx aws.Context, input *dynamodb.QueryInput, opts ...request.Option) (*dynamodb.QueryOutput, error) {
+	// spew.Dump(input)
+
+	var schema []*dynamodb.KeySchemaElement
+	var err error
+	if input.IndexName == nil {
+		schema, err = c.schemaOf(*input.TableName)
+	} else {
+		schema, err = c.schemaOfIndex(*input.TableName, *input.IndexName)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	key := queryKey(input, schema)
+	if out, ok := c.getQuery(*input.TableName, key); ok {
+		c.log("cached query:", key)
+		return out.(*dynamodb.QueryOutput), nil
+	}
+
+	out, err := c.DynamoDB.QueryWithContext(ctx, input, opts...)
+	if err != nil {
+		return out, err
+	}
+	c.log("saving query:", key)
+	c.setQuery(*input.TableName, key, out)
+	return out, err
+}
+
+func queryKey(input *dynamodb.QueryInput, schema []*dynamodb.KeySchemaElement) string {
+	var key string
+	if input.Select != nil {
+		key += *input.Select
+	}
+	if input.ScanIndexForward == nil || (input.ScanIndexForward != nil && *input.ScanIndexForward == true) {
+		key += ".f "
+	} else {
+		key += ".b "
+	}
+	if input.IndexName != nil {
+		key += *input.IndexName + "#"
+	}
+	// TODO: KeyConditionExpression
+	key += *schema[0].AttributeName + cond2str(input.KeyConditions[*schema[0].AttributeName])
+	if len(input.KeyConditions) > 1 {
+		key += "&" + *schema[1].AttributeName + cond2str(input.KeyConditions[*schema[1].AttributeName])
+	}
+	if len(input.ExclusiveStartKey) > 0 {
+		key += "@" + itemKey(*input.TableName, input.ExclusiveStartKey, schema)
+	}
+	if input.FilterExpression != nil {
+		key += "?" + exp2str(*input.FilterExpression, input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+	}
+	if input.Limit != nil {
+		key += "|" + strconv.FormatInt(*input.Limit, 10)
+	}
+	return key
+}
+
+func exp2str(exp string, names map[string]*string, vals map[string]*dynamodb.AttributeValue) string {
+	for k, v := range names {
+		exp = strings.Replace(exp, k, *v, -1)
+	}
+	for k, v := range vals {
+		exp = strings.Replace(exp, k, av2str(v), -1)
+	}
+	return exp
+}
+
+func cond2str(cond *dynamodb.Condition) string {
+	switch *cond.ComparisonOperator {
+	case dynamodb.ComparisonOperatorEq:
+		return "=" + av2str(cond.AttributeValueList[0])
+	case dynamodb.ComparisonOperatorNe:
+		return "!=" + av2str(cond.AttributeValueList[0])
+	case dynamodb.ComparisonOperatorLt:
+		return "<" + av2str(cond.AttributeValueList[0])
+	case dynamodb.ComparisonOperatorLe:
+		return "<=" + av2str(cond.AttributeValueList[0])
+	case dynamodb.ComparisonOperatorGt:
+		return ">" + av2str(cond.AttributeValueList[0])
+	case dynamodb.ComparisonOperatorGe:
+		return ">=" + av2str(cond.AttributeValueList[0])
+	case dynamodb.ComparisonOperatorBeginsWith:
+		return "bw(" + av2str(cond.AttributeValueList[0]) + ")"
+	case dynamodb.ComparisonOperatorBetween:
+		return av2str(cond.AttributeValueList[0]) + "~" + av2str(cond.AttributeValueList[1])
+	}
+	panic("unknown cond " + *cond.ComparisonOperator)
+}
+
 func (c *Cache) schemaOf(table string) ([]*dynamodb.KeySchemaElement, error) {
+	desc, err := c.desc(table)
+	if err != nil {
+		return nil, err
+	}
+	return desc.Table.KeySchema, nil
+}
+
+func (c *Cache) schemaOfIndex(table, index string) ([]*dynamodb.KeySchemaElement, error) {
+	desc, err := c.desc(table)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, gsi := range desc.Table.GlobalSecondaryIndexes {
+		if *gsi.IndexName == index {
+			return gsi.KeySchema, nil
+		}
+	}
+	for _, lsi := range desc.Table.LocalSecondaryIndexes {
+		if *lsi.IndexName == index {
+			return lsi.KeySchema, nil
+		}
+	}
+
+	panic("index not found: " + table + " " + index)
+}
+
+func (c *Cache) desc(table string) (*dynamodb.DescribeTableOutput, error) {
 	item := c.tableDesc.Get(table)
-	var desc interface{}
 	if item == nil {
 		out, err := c.DynamoDB.DescribeTable(&dynamodb.DescribeTableInput{TableName: &table})
 		if err != nil {
 			return nil, err
 		}
-		c.tableDesc.Set(table, out, time.Minute*5)
+		c.tableDesc.Set(table, out, 24*time.Hour)
 		c.log("caching desc", out)
-		desc = out
-	} else {
-		desc = item.Value()
+		return out, nil
 	}
-	return desc.(*dynamodb.DescribeTableOutput).Table.KeySchema, nil
+	return item.Value().(*dynamodb.DescribeTableOutput), nil
 }
 
 func itemKey(table string, key map[string]*dynamodb.AttributeValue, schema []*dynamodb.KeySchemaElement) string {
@@ -351,12 +497,45 @@ func keyEq(a, b map[string]*dynamodb.AttributeValue) bool {
 
 func av2str(av *dynamodb.AttributeValue) string {
 	switch {
-	case av.S != nil:
-		return *av.S
 	case av.B != nil:
 		return string(av.B)
+	case av.BS != nil:
+		return fmt.Sprint(av.BS)
+	case av.BOOL != nil:
+		if *av.BOOL {
+			return "true"
+		}
+		return "false"
 	case av.N != nil:
 		return *av.N
+	case av.S != nil:
+		return *av.S
+	case av.L != nil:
+		ret := "L:"
+		for _, item := range av.L {
+			ret += av2str(item) + ","
+		}
+		return ret
+	case av.NS != nil:
+		ret := "NS:"
+		for _, n := range av.NS {
+			ret += *n + ","
+		}
+		return ret
+	case av.SS != nil:
+		ret := "SS:"
+		for _, s := range av.SS {
+			ret += *s + ","
+		}
+		return ret
+	case av.M != nil:
+		ret := "M:"
+		for k, v := range av.M {
+			ret += k + "=" + av2str(v) + ","
+		}
+		return ret
+	case av.NULL != nil:
+		return "NULL"
 	}
-	panic("invalid key av")
+	panic("unsupported av")
 }
