@@ -179,6 +179,8 @@ func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteIte
 		return nil, err
 	}
 
+	input.ReturnValues = aws.String(dynamodb.ReturnValueAllOld)
+
 	out, err := c.DynamoDB.DeleteItemWithContext(ctx, input, opts...)
 	if err != nil {
 		return out, err
@@ -186,7 +188,7 @@ func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteIte
 
 	key := itemKey(*input.TableName, input.Key, schema)
 	c.deleteItem(key)
-	c.invalidate(*input.TableName, input.Key)
+	c.invalidate(*input.TableName, out.Attributes)
 	c.log("deleting cached", key)
 
 	return out, err
