@@ -1,6 +1,7 @@
 package localcache
 
 import (
+	"bytes"
 	"log"
 	"time"
 
@@ -10,8 +11,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	"github.com/patrickmn/go-cache"
-
-	_ "github.com/davecgh/go-spew/spew"
 )
 
 func New(p client.ConfigProvider, cfgs ...*aws.Config) dynamodbiface.DynamoDBAPI {
@@ -32,6 +31,14 @@ type Cache struct {
 	*dynamodb.DynamoDB
 	items     *cache.Cache
 	tableDesc *cache.Cache
+
+	Debug bool
+}
+
+func (c *Cache) log(v ...interface{}) {
+	if c.Debug {
+		log.Println(v...)
+	}
 }
 
 func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput, opts ...request.Option) (*dynamodb.GetItemOutput, error) {
@@ -42,7 +49,7 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 	}
 	key := itemKey(*input.TableName, input.Key, schema)
 	if item, ok := c.items.Get(key); ok {
-		log.Print("returning cached", key)
+		c.log("returning cached", key)
 		return &dynamodb.GetItemOutput{
 			Item: item.(map[string]*dynamodb.AttributeValue),
 		}, nil
@@ -51,7 +58,7 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 	if err != nil {
 		return out, err
 	}
-	log.Print("caching", key)
+	c.log("caching", key)
 	c.items.Set(key, out.Item, cache.DefaultExpiration)
 	return out, err
 }
@@ -67,7 +74,7 @@ func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput
 	if err != nil {
 		return out, err
 	}
-	log.Println("caching put", key)
+	c.log("caching put", key)
 	c.items.Set(key, input.Item, cache.DefaultExpiration)
 	return out, err
 }
@@ -85,7 +92,7 @@ func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteIte
 
 	key := itemKey(*input.TableName, input.Key, schema)
 	c.items.Delete(key)
-	log.Println("deleting cached", key)
+	c.log("deleting cached", key)
 
 	return out, err
 }
@@ -108,11 +115,158 @@ func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateIte
 
 	key := itemKey(*input.TableName, input.Key, schema)
 	if input.ReturnValues != nil && *input.ReturnValues == dynamodb.ReturnValueAllNew {
-		log.Println("cache updated", key)
+		c.log("cache updated", key)
 		c.items.Set(key, out.Attributes, cache.DefaultExpiration)
 	} else {
-		log.Println("delete updated", key)
+		c.log("delete updated", key)
 		c.items.Delete(key)
+	}
+	return out, err
+}
+
+func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGetItemInput, opts ...request.Option) (*dynamodb.BatchGetItemOutput, error) {
+	schemas := make(map[string][]*dynamodb.KeySchemaElement)
+	fake := &dynamodb.BatchGetItemOutput{
+		Responses:       make(map[string][]map[string]*dynamodb.AttributeValue),
+		UnprocessedKeys: make(map[string]*dynamodb.KeysAndAttributes),
+	}
+	var newReq map[string]*dynamodb.KeysAndAttributes
+	for table, req := range input.RequestItems {
+		schema, ok := schemas[table]
+		if !ok {
+			var err error
+			schema, err = c.schemaOf(table)
+			if err != nil {
+				return nil, err
+			}
+			schemas[table] = schema
+		}
+
+		var newKeys []map[string]*dynamodb.AttributeValue
+
+		for _, k := range req.Keys {
+			key := itemKey(table, k, schema)
+			if item, ok := c.items.Get(key); ok {
+				c.log("batch get cached", key)
+				fake.Responses[table] = append(fake.Responses[table], item.(map[string]*dynamodb.AttributeValue))
+			} else {
+				newKeys = append(newKeys, k)
+			}
+		}
+
+		if len(newKeys) > 0 {
+			if newReq == nil {
+				newReq = make(map[string]*dynamodb.KeysAndAttributes)
+			}
+			req.Keys = newKeys
+			newReq[table] = req
+		}
+	}
+
+	if len(newReq) == 0 {
+		return fake, nil
+	}
+
+	input.RequestItems = newReq
+	out, err := c.DynamoDB.BatchGetItemWithContext(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	for table, resp := range out.Responses {
+		for _, item := range resp {
+			key := itemKey(table, item, schemas[table])
+			c.log("batch get caching", key)
+			c.items.Set(key, item, cache.DefaultExpiration)
+		}
+	}
+
+	if len(fake.Responses) == 0 {
+		return out, err
+	}
+
+	for table, resp := range fake.Responses {
+		out.Responses[table] = append(out.Responses[table], resp...)
+	}
+
+	return out, nil
+}
+
+func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.BatchWriteItemInput, opts ...request.Option) (*dynamodb.BatchWriteItemOutput, error) {
+	out, err := c.DynamoDB.BatchWriteItemWithContext(ctx, input, opts...)
+	if err != nil {
+		return out, err
+	}
+	for table, reqs := range input.RequestItems {
+		schema, err := c.schemaOf(table)
+		if err != nil {
+			// TODO: probably bad to error out here
+			return out, err
+		}
+	next:
+		for _, req := range reqs {
+			if req.DeleteRequest != nil {
+				for _, unprocessed := range out.UnprocessedItems[table] {
+					if unprocessed.DeleteRequest == nil {
+						continue
+					}
+					if keyEq(unprocessed.DeleteRequest.Key, req.DeleteRequest.Key) {
+						continue next
+					}
+				}
+				key := itemKey(table, req.DeleteRequest.Key, schema)
+				c.log("batch delete", key)
+				c.items.Delete(key)
+			} else if req.PutRequest != nil {
+				for _, unprocessed := range out.UnprocessedItems[table] {
+					if unprocessed.PutRequest == nil {
+						continue
+					}
+					if keyEq(unprocessed.PutRequest.Item, req.PutRequest.Item) {
+						continue next
+					}
+				}
+				key := itemKey(table, req.PutRequest.Item, schema)
+				c.log("batch put", key)
+				c.items.Set(key, req.PutRequest.Item, cache.DefaultExpiration)
+			}
+		}
+	}
+	return out, err
+}
+
+func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.TransactWriteItemsInput, opts ...request.Option) (*dynamodb.TransactWriteItemsOutput, error) {
+	out, err := c.DynamoDB.TransactWriteItemsWithContext(ctx, input, opts...)
+	if err != nil {
+		return out, err
+	}
+	for _, req := range input.TransactItems {
+		switch {
+		case req.Put != nil:
+			schema, err := c.schemaOf(*req.Put.TableName)
+			if err != nil {
+				return out, err
+			}
+			key := itemKey(*req.Put.TableName, req.Put.Item, schema)
+			c.log("transact put", key)
+			c.items.Set(key, req.Put.Item, cache.DefaultExpiration)
+		case req.Delete != nil:
+			schema, err := c.schemaOf(*req.Delete.TableName)
+			if err != nil {
+				return out, err
+			}
+			key := itemKey(*req.Delete.TableName, req.Delete.Key, schema)
+			c.log("transact delete", key)
+			c.items.Delete(key)
+		case req.Update != nil:
+			schema, err := c.schemaOf(*req.Update.TableName)
+			if err != nil {
+				return out, err
+			}
+			key := itemKey(*req.Update.TableName, req.Update.Key, schema)
+			c.log("transact update", key)
+			c.items.Delete(key)
+		}
 	}
 	return out, err
 }
@@ -125,7 +279,7 @@ func (c *Cache) schemaOf(table string) ([]*dynamodb.KeySchemaElement, error) {
 			return nil, err
 		}
 		c.tableDesc.Set(table, out, cache.DefaultExpiration)
-		log.Println("caching desc", out)
+		c.log("caching desc", out)
 		desc = out
 	}
 	return desc.(*dynamodb.DescribeTableOutput).Table.KeySchema, nil
@@ -137,6 +291,42 @@ func itemKey(table string, key map[string]*dynamodb.AttributeValue, schema []*dy
 	}
 	return table + "$" + *schema[0].AttributeName + ":" + av2str(key[*schema[0].AttributeName]) + "/" +
 		*schema[1].AttributeName + ":" + av2str(key[*schema[1].AttributeName])
+}
+
+func keyEq(a, b map[string]*dynamodb.AttributeValue) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		other, ok := b[k]
+		if !ok {
+			return false
+		}
+		switch {
+		case v.S != nil:
+			if other.S == nil {
+				return false
+			}
+			if *v.S != *other.S {
+				return false
+			}
+		case v.B != nil:
+			if other.B == nil {
+				return false
+			}
+			if !bytes.Equal(v.B, other.B) {
+				return false
+			}
+		case v.N != nil:
+			if other.N == nil {
+				return false
+			}
+			if *v.N != *other.N {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func av2str(av *dynamodb.AttributeValue) string {
