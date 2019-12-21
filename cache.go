@@ -10,7 +10,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
-	"github.com/patrickmn/go-cache"
+	// "github.com/patrickmn/go-cache"
+	"github.com/karlseguin/ccache"
 )
 
 func New(p client.ConfigProvider, cfgs ...*aws.Config) dynamodbiface.DynamoDBAPI {
@@ -22,15 +23,15 @@ func NewWithDB(client *dynamodb.DynamoDB) dynamodbiface.DynamoDBAPI {
 	return &Cache{
 		DynamoDB: client,
 
-		items:     cache.New(5*time.Minute, 10*time.Minute),
-		tableDesc: cache.New(cache.NoExpiration, cache.NoExpiration),
+		items:     ccache.New(ccache.Configure()),
+		tableDesc: ccache.New(ccache.Configure()),
 	}
 }
 
 type Cache struct {
 	*dynamodb.DynamoDB
-	items     *cache.Cache
-	tableDesc *cache.Cache
+	items     *ccache.Cache
+	tableDesc *ccache.Cache
 
 	Debug bool
 }
@@ -41,6 +42,22 @@ func (c *Cache) log(v ...interface{}) {
 	}
 }
 
+func (c *Cache) getItem(key string) (interface{}, bool) {
+	item := c.items.Get(key)
+	if item == nil {
+		return nil, false
+	}
+	return item.Value(), true
+}
+
+func (c *Cache) setItem(key string, v interface{}) {
+	c.items.Set(key, v, 5*time.Minute)
+}
+
+func (c *Cache) deleteItem(key string) {
+	c.items.Delete(key)
+}
+
 func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput, opts ...request.Option) (*dynamodb.GetItemOutput, error) {
 	// spew.Dump(input)
 	schema, err := c.schemaOf(*input.TableName)
@@ -48,7 +65,7 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 		return nil, err
 	}
 	key := itemKey(*input.TableName, input.Key, schema)
-	if item, ok := c.items.Get(key); ok {
+	if item, ok := c.getItem(key); ok {
 		c.log("returning cached", key)
 		return &dynamodb.GetItemOutput{
 			Item: item.(map[string]*dynamodb.AttributeValue),
@@ -59,7 +76,7 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 		return out, err
 	}
 	c.log("caching", key)
-	c.items.Set(key, out.Item, cache.DefaultExpiration)
+	c.setItem(key, out.Item)
 	return out, err
 }
 
@@ -75,7 +92,7 @@ func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput
 		return out, err
 	}
 	c.log("caching put", key)
-	c.items.Set(key, input.Item, cache.DefaultExpiration)
+	c.setItem(key, input.Item)
 	return out, err
 }
 
@@ -91,7 +108,7 @@ func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteIte
 	}
 
 	key := itemKey(*input.TableName, input.Key, schema)
-	c.items.Delete(key)
+	c.deleteItem(key)
 	c.log("deleting cached", key)
 
 	return out, err
@@ -116,10 +133,10 @@ func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateIte
 	key := itemKey(*input.TableName, input.Key, schema)
 	if input.ReturnValues != nil && *input.ReturnValues == dynamodb.ReturnValueAllNew {
 		c.log("cache updated", key)
-		c.items.Set(key, out.Attributes, cache.DefaultExpiration)
+		c.setItem(key, out.Attributes)
 	} else {
 		c.log("delete updated", key)
-		c.items.Delete(key)
+		c.deleteItem(key)
 	}
 	return out, err
 }
@@ -146,7 +163,7 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 
 		for _, k := range req.Keys {
 			key := itemKey(table, k, schema)
-			if item, ok := c.items.Get(key); ok {
+			if item, ok := c.getItem(key); ok {
 				c.log("batch get cached", key)
 				fake.Responses[table] = append(fake.Responses[table], item.(map[string]*dynamodb.AttributeValue))
 			} else {
@@ -177,7 +194,7 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 		for _, item := range resp {
 			key := itemKey(table, item, schemas[table])
 			c.log("batch get caching", key)
-			c.items.Set(key, item, cache.DefaultExpiration)
+			c.setItem(key, item)
 		}
 	}
 
@@ -216,7 +233,7 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 				}
 				key := itemKey(table, req.DeleteRequest.Key, schema)
 				c.log("batch delete", key)
-				c.items.Delete(key)
+				c.deleteItem(key)
 			} else if req.PutRequest != nil {
 				for _, unprocessed := range out.UnprocessedItems[table] {
 					if unprocessed.PutRequest == nil {
@@ -228,7 +245,7 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 				}
 				key := itemKey(table, req.PutRequest.Item, schema)
 				c.log("batch put", key)
-				c.items.Set(key, req.PutRequest.Item, cache.DefaultExpiration)
+				c.setItem(key, req.PutRequest.Item)
 			}
 		}
 	}
@@ -249,7 +266,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			}
 			key := itemKey(*req.Put.TableName, req.Put.Item, schema)
 			c.log("transact put", key)
-			c.items.Set(key, req.Put.Item, cache.DefaultExpiration)
+			c.setItem(key, req.Put.Item)
 		case req.Delete != nil:
 			schema, err := c.schemaOf(*req.Delete.TableName)
 			if err != nil {
@@ -257,7 +274,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			}
 			key := itemKey(*req.Delete.TableName, req.Delete.Key, schema)
 			c.log("transact delete", key)
-			c.items.Delete(key)
+			c.deleteItem(key)
 		case req.Update != nil:
 			schema, err := c.schemaOf(*req.Update.TableName)
 			if err != nil {
@@ -265,22 +282,25 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			}
 			key := itemKey(*req.Update.TableName, req.Update.Key, schema)
 			c.log("transact update", key)
-			c.items.Delete(key)
+			c.deleteItem(key)
 		}
 	}
 	return out, err
 }
 
 func (c *Cache) schemaOf(table string) ([]*dynamodb.KeySchemaElement, error) {
-	desc, ok := c.tableDesc.Get(table)
-	if !ok {
+	item := c.tableDesc.Get(table)
+	var desc interface{}
+	if item == nil {
 		out, err := c.DynamoDB.DescribeTable(&dynamodb.DescribeTableInput{TableName: &table})
 		if err != nil {
 			return nil, err
 		}
-		c.tableDesc.Set(table, out, cache.DefaultExpiration)
+		c.tableDesc.Set(table, out, time.Minute*5)
 		c.log("caching desc", out)
 		desc = out
+	} else {
+		desc = item.Value()
 	}
 	return desc.(*dynamodb.DescribeTableOutput).Table.KeySchema, nil
 }
