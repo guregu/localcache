@@ -36,8 +36,11 @@ type Cache struct {
 
 func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput, opts ...request.Option) (*dynamodb.GetItemOutput, error) {
 	// spew.Dump(input)
-	key := *input.TableName + "$" + key2str(input.Key)
-	// key := fmt.Sprintf("%s %v"), *input.TableName, *input.)
+	schema, err := c.schemaOf(*input.TableName)
+	if err != nil {
+		return nil, err
+	}
+	key := itemKey(*input.TableName, input.Key, schema)
 	if item, ok := c.items.Get(key); ok {
 		log.Print("returning cached", key)
 		return &dynamodb.GetItemOutput{
@@ -54,18 +57,11 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 }
 
 func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput, opts ...request.Option) (*dynamodb.PutItemOutput, error) {
-	desc, ok := c.tableDesc.Get(*input.TableName)
-	if !ok {
-		out, err := c.DynamoDB.DescribeTable(&dynamodb.DescribeTableInput{TableName: input.TableName})
-		if err != nil {
-			return nil, err
-		}
-		c.tableDesc.Set(*input.TableName, out, cache.DefaultExpiration)
-		log.Println("caching desc", out)
-		desc = out
+	schema, err := c.schemaOf(*input.TableName)
+	if err != nil {
+		return nil, err
 	}
-	schema := desc.(*dynamodb.DescribeTableOutput).Table.KeySchema
-	key := putKey(*input.TableName, input.Item, schema)
+	key := itemKey(*input.TableName, input.Item, schema)
 
 	out, err := c.DynamoDB.PutItemWithContext(ctx, input, opts...)
 	if err != nil {
@@ -76,31 +72,71 @@ func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput
 	return out, err
 }
 
-func putKey(table string, item map[string]*dynamodb.AttributeValue, schema []*dynamodb.KeySchemaElement) string {
-	key := table + "$" + *schema[0].AttributeName + ":" + av2str(item[*schema[0].AttributeName])
-	if len(schema) > 1 {
-		key += "/" + *schema[1].AttributeName + ":" + av2str(item[*schema[1].AttributeName])
+func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteItemInput, opts ...request.Option) (*dynamodb.DeleteItemOutput, error) {
+	schema, err := c.schemaOf(*input.TableName)
+	if err != nil {
+		return nil, err
 	}
-	return key
+
+	out, err := c.DynamoDB.DeleteItemWithContext(ctx, input, opts...)
+	if err != nil {
+		return out, err
+	}
+
+	key := itemKey(*input.TableName, input.Key, schema)
+	c.items.Delete(key)
+	log.Println("deleting cached", key)
+
+	return out, err
 }
 
-func key2str(key map[string]*dynamodb.AttributeValue) string {
-	if len(key) == 1 {
-		for k, v := range key {
-			return k + ":" + av2str(v)
+func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateItemInput, opts ...request.Option) (*dynamodb.UpdateItemOutput, error) {
+	schema, err := c.schemaOf(*input.TableName)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: undo this later maybe
+	if input.ReturnValues == nil || *input.ReturnValues == dynamodb.ReturnValueNone {
+		input.ReturnValues = aws.String(dynamodb.ReturnValueAllNew)
+	}
+
+	out, err := c.DynamoDB.UpdateItemWithContext(ctx, input, opts...)
+	if err != nil {
+		return out, err
+	}
+
+	key := itemKey(*input.TableName, input.Key, schema)
+	if input.ReturnValues != nil && *input.ReturnValues == dynamodb.ReturnValueAllNew {
+		log.Println("cache updated", key)
+		c.items.Set(key, out.Attributes, cache.DefaultExpiration)
+	} else {
+		log.Println("delete updated", key)
+		c.items.Delete(key)
+	}
+	return out, err
+}
+
+func (c *Cache) schemaOf(table string) ([]*dynamodb.KeySchemaElement, error) {
+	desc, ok := c.tableDesc.Get(table)
+	if !ok {
+		out, err := c.DynamoDB.DescribeTable(&dynamodb.DescribeTableInput{TableName: &table})
+		if err != nil {
+			return nil, err
 		}
+		c.tableDesc.Set(table, out, cache.DefaultExpiration)
+		log.Println("caching desc", out)
+		desc = out
 	}
-	var a, b string
-	for k, v := range key {
-		if a == "" {
-			a = k + ":" + av2str(v)
-		}
-		b = k + ":" + av2str(v)
+	return desc.(*dynamodb.DescribeTableOutput).Table.KeySchema, nil
+}
+
+func itemKey(table string, key map[string]*dynamodb.AttributeValue, schema []*dynamodb.KeySchemaElement) string {
+	if len(schema) == 1 {
+		return table + "$" + *schema[0].AttributeName + ":" + av2str(key[*schema[0].AttributeName])
 	}
-	if a[0] < b[0] {
-		return a + "/" + b
-	}
-	return b + "/" + a
+	return table + "$" + *schema[0].AttributeName + ":" + av2str(key[*schema[0].AttributeName]) + "/" +
+		*schema[1].AttributeName + ":" + av2str(key[*schema[1].AttributeName])
 }
 
 func av2str(av *dynamodb.AttributeValue) string {
