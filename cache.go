@@ -30,6 +30,8 @@ func NewWithDB(client *dynamodb.DynamoDB) dynamodbiface.DynamoDBAPI {
 		tableDesc: ccache.New(ccache.Configure()),
 		queries:   ccache.Layered(ccache.Configure()),
 		scans:     ccache.Layered(ccache.Configure()),
+
+		allowedTables: map[string]struct{}{},
 	}
 }
 
@@ -41,7 +43,25 @@ type Cache struct {
 	queries   *ccache.LayeredCache
 	scans     *ccache.LayeredCache
 
+	allowedTables map[string]struct{}
+
 	Debug bool
+}
+
+func (c *Cache) Allow(table string) {
+	c.allowedTables[table] = struct{}{}
+}
+
+func (c *Cache) isAllowed(table string) bool {
+	if len(c.allowedTables) == 0 {
+		return true
+	}
+	_, ok := c.allowedTables[table]
+	return ok
+}
+
+func (c *Cache) warmup() {
+	// c.DynamoDB.ListTablesPages(input, fn)
 }
 
 func (c *Cache) log(v ...interface{}) {
@@ -143,6 +163,10 @@ func tableHashKey(table, hk, idx string) string {
 var emptyGet = &dynamodb.GetItemOutput{}
 
 func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput, opts ...request.Option) (*dynamodb.GetItemOutput, error) {
+	if !c.isAllowed(*input.TableName) {
+		return c.DynamoDB.GetItemWithContext(ctx, input, opts...)
+	}
+
 	// spew.Dump(input)
 	schema, err := c.schemaOf(*input.TableName)
 	if err != nil {
@@ -169,6 +193,10 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 }
 
 func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput, opts ...request.Option) (*dynamodb.PutItemOutput, error) {
+	if !c.isAllowed(*input.TableName) {
+		return c.DynamoDB.PutItemWithContext(ctx, input, opts...)
+	}
+
 	schema, err := c.schemaOf(*input.TableName)
 	if err != nil {
 		return nil, err
@@ -186,6 +214,10 @@ func (c *Cache) PutItemWithContext(ctx aws.Context, input *dynamodb.PutItemInput
 }
 
 func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteItemInput, opts ...request.Option) (*dynamodb.DeleteItemOutput, error) {
+	if !c.isAllowed(*input.TableName) {
+		return c.DynamoDB.DeleteItemWithContext(ctx, input, opts...)
+	}
+
 	schema, err := c.schemaOf(*input.TableName)
 	if err != nil {
 		return nil, err
@@ -207,6 +239,10 @@ func (c *Cache) DeleteItemWithContext(ctx aws.Context, input *dynamodb.DeleteIte
 }
 
 func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateItemInput, opts ...request.Option) (*dynamodb.UpdateItemOutput, error) {
+	if !c.isAllowed(*input.TableName) {
+		return c.DynamoDB.UpdateItemWithContext(ctx, input, opts...)
+	}
+
 	schema, err := c.schemaOf(*input.TableName)
 	if err != nil {
 		return nil, err
@@ -414,6 +450,10 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 }
 
 func (c *Cache) QueryWithContext(ctx aws.Context, input *dynamodb.QueryInput, opts ...request.Option) (*dynamodb.QueryOutput, error) {
+	if !c.isAllowed(*input.TableName) {
+		return c.DynamoDB.QueryWithContext(ctx, input, opts...)
+	}
+
 	// spew.Dump(input)
 	var idx string
 	var schema []*dynamodb.KeySchemaElement
@@ -481,6 +521,10 @@ func queryKey(input *dynamodb.QueryInput, schema []*dynamodb.KeySchemaElement) s
 }
 
 func (c *Cache) ScanWithContext(ctx aws.Context, input *dynamodb.ScanInput, opts ...request.Option) (*dynamodb.ScanOutput, error) {
+	if !c.isAllowed(*input.TableName) {
+		return c.DynamoDB.ScanWithContext(ctx, input, opts...)
+	}
+
 	schema, err := c.schemaOf(*input.TableName)
 	if err != nil {
 		return nil, err
@@ -646,6 +690,9 @@ func keyEqLoose(a, b map[string]*dynamodb.AttributeValue) bool {
 }
 
 func av2str(av *dynamodb.AttributeValue) string {
+	if av == nil {
+		return "<nil>"
+	}
 	switch {
 	case av.B != nil:
 		return string(av.B)
