@@ -149,6 +149,10 @@ func (c *Cache) invalidate(table string, item map[string]*dynamodb.AttributeValu
 	}
 }
 
+func (c *Cache) invalidateRough(table string, item map[string]*dynamodb.AttributeValue) {
+	c.invalidate(table, item)
+}
+
 func tableHashKey(table, hk, idx string) string {
 	key := table
 	if hk != "" {
@@ -253,6 +257,14 @@ func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateIte
 		input.ReturnValues = aws.String(dynamodb.ReturnValueAllNew)
 	}
 
+	if input.ReturnValues == nil || *input.ReturnValues != dynamodb.ReturnValueAllNew {
+		prefetch := c.newPrefetcher()
+		prefetch.add(*input.TableName, input.Key)
+		if err := prefetch.run(ctx, opts...); err != nil {
+			return nil, err
+		}
+	}
+
 	out, err := c.DynamoDB.UpdateItemWithContext(ctx, input, opts...)
 	if err != nil {
 		return out, err
@@ -266,8 +278,7 @@ func (c *Cache) UpdateItemWithContext(ctx aws.Context, input *dynamodb.UpdateIte
 	} else {
 		c.log("delete updated", key)
 		c.deleteItem(key)
-		// TODO: this could miss invalidating an index...
-		c.invalidate(*input.TableName, input.Key)
+		c.invalidateRough(*input.TableName, input.Key)
 	}
 	return out, err
 }
@@ -366,6 +377,18 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 }
 
 func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.BatchWriteItemInput, opts ...request.Option) (*dynamodb.BatchWriteItemOutput, error) {
+	prefetch := c.newPrefetcher()
+	for table, reqs := range input.RequestItems {
+		for _, req := range reqs {
+			if req.DeleteRequest != nil {
+				prefetch.add(table, req.DeleteRequest.Key)
+			}
+		}
+	}
+	if err := prefetch.run(ctx, opts...); err != nil {
+		return nil, err
+	}
+
 	out, err := c.DynamoDB.BatchWriteItemWithContext(ctx, input, opts...)
 	if err != nil {
 		return out, err
@@ -390,7 +413,7 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 				key := itemKey(table, req.DeleteRequest.Key, schema)
 				c.log("batch delete", key)
 				c.setItem(key, none)
-				c.invalidate(table, req.DeleteRequest.Key)
+				c.invalidateRough(table, req.DeleteRequest.Key)
 			} else if req.PutRequest != nil {
 				for _, unprocessed := range out.UnprocessedItems[table] {
 					if unprocessed.PutRequest == nil {
@@ -411,6 +434,19 @@ func (c *Cache) BatchWriteItemWithContext(ctx aws.Context, input *dynamodb.Batch
 }
 
 func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.TransactWriteItemsInput, opts ...request.Option) (*dynamodb.TransactWriteItemsOutput, error) {
+	prefetch := c.newPrefetcher()
+	for _, item := range input.TransactItems {
+		if item.Update != nil {
+			prefetch.add(*item.Update.TableName, item.Update.Key)
+		}
+		if item.Delete != nil {
+			prefetch.add(*item.Delete.TableName, item.Delete.Key)
+		}
+	}
+	if err := prefetch.run(ctx, opts...); err != nil {
+		return nil, err
+	}
+
 	out, err := c.DynamoDB.TransactWriteItemsWithContext(ctx, input, opts...)
 	if err != nil {
 		return out, err
@@ -434,7 +470,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Delete.TableName, req.Delete.Key, schema)
 			c.log("transact delete", key)
 			c.setItem(key, none)
-			c.invalidate(*req.Delete.TableName, req.Delete.Key)
+			c.invalidateRough(*req.Delete.TableName, req.Delete.Key)
 		case req.Update != nil:
 			schema, err := c.schemaOf(*req.Update.TableName)
 			if err != nil {
@@ -443,7 +479,7 @@ func (c *Cache) TransactWriteItemsWithContext(ctx aws.Context, input *dynamodb.T
 			key := itemKey(*req.Update.TableName, req.Update.Key, schema)
 			c.log("transact update", key)
 			c.deleteItem(key)
-			c.invalidate(*req.Update.TableName, req.Update.Key)
+			c.invalidateRough(*req.Update.TableName, req.Update.Key)
 		}
 	}
 	return out, err
@@ -597,6 +633,49 @@ func cond2str(cond *dynamodb.Condition) string {
 		return av2str(cond.AttributeValueList[0]) + "~" + av2str(cond.AttributeValueList[1])
 	}
 	panic("unknown cond " + *cond.ComparisonOperator)
+}
+
+type prefetcher struct {
+	cache *Cache
+	batch *dynamodb.BatchGetItemInput
+}
+
+func (c *Cache) newPrefetcher() *prefetcher {
+	return &prefetcher{
+		cache: c,
+	}
+}
+
+func (p *prefetcher) add(table string, key map[string]*dynamodb.AttributeValue) {
+	if p.batch == nil {
+		p.batch = &dynamodb.BatchGetItemInput{
+			RequestItems: make(map[string]*dynamodb.KeysAndAttributes),
+		}
+	}
+	kas := p.batch.RequestItems[table]
+	if kas == nil {
+		kas = &dynamodb.KeysAndAttributes{
+			ConsistentRead: aws.Bool(true),
+		}
+		p.batch.RequestItems[table] = kas
+	}
+	kas.Keys = append(kas.Keys, key)
+}
+
+func (p *prefetcher) run(ctx aws.Context, opts ...request.Option) error {
+	if p.batch == nil {
+		return nil
+	}
+	err := p.cache.BatchGetItemPagesWithContext(ctx, p.batch, func(out *dynamodb.BatchGetItemOutput, _ bool) bool {
+		for table, resps := range out.Responses {
+			for _, resp := range resps {
+				p.cache.log("hacky invalidate:", table, resp)
+				p.cache.invalidate(table, resp)
+			}
+		}
+		return true
+	}, opts...)
+	return err
 }
 
 func (c *Cache) schemaOf(table string) ([]*dynamodb.KeySchemaElement, error) {
