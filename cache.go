@@ -48,6 +48,13 @@ type Cache struct {
 	Debug bool
 }
 
+func (c *Cache) PurgeAll() {
+	c.items.Clear()
+	c.tableDesc.Clear()
+	c.queries.Clear()
+	c.scans.Clear()
+}
+
 func (c *Cache) Allow(table string) {
 	c.allowedTables[table] = struct{}{}
 }
@@ -320,8 +327,10 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 			if newReq == nil {
 				newReq = make(map[string]*dynamodb.KeysAndAttributes)
 			}
-			req.Keys = newKeys
-			newReq[table] = req
+			// TODO: support projections etc
+			newReq[table] = &dynamodb.KeysAndAttributes{
+				Keys: newKeys,
+			}
 		}
 	}
 
@@ -329,8 +338,11 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 		return fake, nil
 	}
 
-	input.RequestItems = newReq
-	out, err := c.DynamoDB.BatchGetItemWithContext(ctx, input, opts...)
+	newInput := &dynamodb.BatchGetItemInput{
+		RequestItems:           newReq,
+		ReturnConsumedCapacity: input.ReturnConsumedCapacity,
+	}
+	out, err := c.DynamoDB.BatchGetItemWithContext(ctx, newInput, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +353,6 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 			c.log("batch get caching", key)
 			c.setItem(key, item)
 		}
-		// TODO: cache missing items too
 	}
 
 	for table, keys := range newReq {
@@ -372,7 +383,6 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 	for table, resp := range fake.Responses {
 		out.Responses[table] = append(out.Responses[table], resp...)
 	}
-
 	return out, nil
 }
 
