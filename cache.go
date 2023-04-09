@@ -17,6 +17,8 @@ import (
 	// "github.com/davecgh/go-spew/spew"
 )
 
+const cacheTTL = 15 * time.Minute
+
 func New(p client.ConfigProvider, cfgs ...*aws.Config) dynamodbiface.DynamoDBAPI {
 	db := dynamodb.New(p, cfgs...)
 	return NewWithDB(db)
@@ -84,6 +86,9 @@ func (c *Cache) getItem(key string) (interface{}, bool) {
 	if item == nil {
 		return nil, false
 	}
+	if item.Expired() {
+		return nil, false
+	}
 	v := item.Value()
 	// if v == none {
 	// 	return nil, true
@@ -92,7 +97,7 @@ func (c *Cache) getItem(key string) (interface{}, bool) {
 }
 
 func (c *Cache) setItem(key string, v interface{}) {
-	c.items.Set(key, v, 5*time.Minute)
+	c.items.Set(key, v, cacheTTL)
 }
 
 func (c *Cache) deleteItem(key string) {
