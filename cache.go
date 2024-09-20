@@ -6,6 +6,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -34,6 +35,9 @@ func NewWithDB(client *dynamodb.DynamoDB) dynamodbiface.DynamoDBAPI {
 		scans:     ccache.Layered(ccache.Configure()),
 
 		allowedTables: map[string]struct{}{},
+
+		hits: new(atomic.Uint64),
+		miss: new(atomic.Uint64),
 	}
 }
 
@@ -48,6 +52,9 @@ type Cache struct {
 	allowedTables map[string]struct{}
 
 	Debug bool
+
+	hits *atomic.Uint64
+	miss *atomic.Uint64
 }
 
 func (c *Cache) PurgeAll() {
@@ -73,13 +80,28 @@ func (c *Cache) warmup() {
 	// c.DynamoDB.ListTablesPages(input, fn)
 }
 
+func (c *Cache) incHit() {
+	c.hits.Add(1)
+}
+
+func (c *Cache) incMiss() {
+	c.miss.Add(1)
+}
+
+func (c *Cache) HitRatio() float64 {
+	hits := c.hits.Load()
+	miss := c.miss.Load()
+	total := hits + miss
+	return float64(hits) / max(float64(total), 1)
+}
+
 func (c *Cache) log(v ...interface{}) {
 	if c.Debug {
 		log.Println(v...)
 	}
 }
 
-var none = struct{}{}
+var none = &struct{}{}
 
 func (c *Cache) getItem(key string) (interface{}, bool) {
 	item := c.items.Get(key)
@@ -137,24 +159,24 @@ func (c *Cache) invalidate(table string, item map[string]*dynamodb.AttributeValu
 	if len(desc.Table.KeySchema) == 1 {
 		c.queries.DeleteAll(table)
 	} else {
-		key := tableHashKey(table, av2str(item[*desc.Table.KeySchema[0].AttributeName]), "")
+		key := tableHashKey(table, (item[*desc.Table.KeySchema[0].AttributeName]), "")
 		c.log("invalidate", key)
 		c.queries.DeleteAll(key)
 	}
 	for _, gsi := range desc.Table.GlobalSecondaryIndexes {
 		if len(gsi.KeySchema) == 1 {
-			key := tableHashKey(table, "", *gsi.IndexName)
+			key := tableHashKey(table, nil, *gsi.IndexName)
 			c.log("invalidate", key)
 			c.queries.DeleteAll(key)
 		} else if hk, ok := item[*gsi.KeySchema[0].AttributeName]; ok {
-			key := tableHashKey(table, av2str(hk), *gsi.IndexName)
+			key := tableHashKey(table, (hk), *gsi.IndexName)
 			c.log("invalidate", key)
 			c.queries.DeleteAll(key)
 		}
 	}
 	for _, lsi := range desc.Table.LocalSecondaryIndexes {
 		if hk, ok := item[*lsi.KeySchema[0].AttributeName]; ok {
-			key := tableHashKey(table, av2str(hk), *lsi.IndexName)
+			key := tableHashKey(table, (hk), *lsi.IndexName)
 			c.log("invalidate", key)
 			c.queries.DeleteAll(key)
 		}
@@ -165,15 +187,18 @@ func (c *Cache) invalidateRough(table string, item map[string]*dynamodb.Attribut
 	c.invalidate(table, item)
 }
 
-func tableHashKey(table, hk, idx string) string {
-	key := table
-	if hk != "" {
-		key += "&" + hk
+func tableHashKey(table string, hk *dynamodb.AttributeValue, idx string) string {
+	var key strings.Builder
+	key.WriteString(table)
+	if hk != nil {
+		key.WriteByte('&')
+		fav2str(&key, hk)
 	}
 	if idx != "" {
-		key += "#" + idx
+		key.WriteByte('#')
+		key.WriteString(idx)
 	}
-	return key
+	return key.String()
 }
 
 var emptyGet = &dynamodb.GetItemOutput{}
@@ -190,6 +215,7 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 	}
 	key := itemKey(*input.TableName, input.Key, schema)
 	if item, ok := c.getItem(key); ok {
+		c.incHit()
 		if item == none {
 			c.log("returning empty cached", key)
 			return emptyGet, nil
@@ -199,6 +225,7 @@ func (c *Cache) GetItemWithContext(ctx aws.Context, input *dynamodb.GetItemInput
 			Item: item.(map[string]*dynamodb.AttributeValue),
 		}, nil
 	}
+	c.incMiss()
 	out, err := c.DynamoDB.GetItemWithContext(ctx, input, opts...)
 	if err != nil {
 		return out, err
@@ -319,11 +346,13 @@ func (c *Cache) BatchGetItemWithContext(ctx aws.Context, input *dynamodb.BatchGe
 			key := itemKey(table, k, schema)
 			if item, ok := c.getItem(key); ok {
 				c.log("batch get cached", key)
+				c.incHit()
 				if item != none {
 					fake.Responses[table] = append(fake.Responses[table], item.(map[string]*dynamodb.AttributeValue))
 				}
 			} else {
 				c.log("batch get NOT cached!!", key)
+				c.incMiss()
 				newKeys = append(newKeys, k)
 			}
 		}
@@ -520,16 +549,17 @@ func (c *Cache) QueryWithContext(ctx aws.Context, input *dynamodb.QueryInput, op
 	}
 	var tkey string
 	if len(schema) == 1 {
-		tkey = tableHashKey(*input.TableName, "", idx)
+		tkey = tableHashKey(*input.TableName, nil, idx)
 	} else {
-		tkey = tableHashKey(*input.TableName, av2str(input.KeyConditions[*schema[0].AttributeName].AttributeValueList[0]), idx)
+		tkey = tableHashKey(*input.TableName, input.KeyConditions[*schema[0].AttributeName].AttributeValueList[0], idx)
 	}
 	key := queryKey(input, schema)
 	if out, ok := c.getQuery(tkey, key); ok {
 		c.log("cached query:", tkey, key)
+		c.incHit()
 		return out.(*dynamodb.QueryOutput), nil
 	}
-
+	c.incMiss()
 	out, err := c.DynamoDB.QueryWithContext(ctx, input, opts...)
 	if err != nil {
 		return out, err
@@ -540,35 +570,40 @@ func (c *Cache) QueryWithContext(ctx aws.Context, input *dynamodb.QueryInput, op
 }
 
 func queryKey(input *dynamodb.QueryInput, schema []*dynamodb.KeySchemaElement) string {
-	var key string
+	var key strings.Builder
 	if input.Select != nil {
-		key = *input.Select
+		key.WriteString(*input.Select)
 	} else {
-		key = "*"
+		key.WriteByte('*')
 	}
 	if input.ScanIndexForward == nil || (input.ScanIndexForward != nil && *input.ScanIndexForward == true) {
-		key += ".f "
+		key.WriteString(".f ")
 	} else {
-		key += ".b "
+		key.WriteString(".b ")
 	}
 	if input.IndexName != nil {
-		key += *input.IndexName + "#"
+		key.WriteString(*input.IndexName + "#")
 	}
 	// TODO: KeyConditionExpression
-	key += *schema[0].AttributeName + cond2str(input.KeyConditions[*schema[0].AttributeName])
+	key.WriteString(*schema[0].AttributeName)
+	key.WriteByte('`')
+	cond2str(&key, input.KeyConditions[*schema[0].AttributeName])
 	if len(input.KeyConditions) > 1 {
-		key += "&" + *schema[1].AttributeName + cond2str(input.KeyConditions[*schema[1].AttributeName])
+		key.WriteByte('&')
+		key.WriteString(*schema[1].AttributeName)
+		key.WriteByte('`')
+		cond2str(&key, input.KeyConditions[*schema[1].AttributeName])
 	}
 	if len(input.ExclusiveStartKey) > 0 {
-		key += "@" + itemKey(*input.TableName, input.ExclusiveStartKey, schema)
+		key.WriteString("@" + itemKey(*input.TableName, input.ExclusiveStartKey, schema))
 	}
 	if input.FilterExpression != nil {
-		key += "?" + exp2str(*input.FilterExpression, input.ExpressionAttributeNames, input.ExpressionAttributeValues)
+		key.WriteString("?" + exp2str(*input.FilterExpression, input.ExpressionAttributeNames, input.ExpressionAttributeValues))
 	}
 	if input.Limit != nil {
-		key += "|" + strconv.FormatInt(*input.Limit, 10)
+		key.WriteString("|" + strconv.FormatInt(*input.Limit, 10))
 	}
-	return key
+	return key.String()
 }
 
 func (c *Cache) ScanWithContext(ctx aws.Context, input *dynamodb.ScanInput, opts ...request.Option) (*dynamodb.ScanOutput, error) {
@@ -584,6 +619,7 @@ func (c *Cache) ScanWithContext(ctx aws.Context, input *dynamodb.ScanInput, opts
 	key := scanKey(input, schema)
 	if out, ok := c.getScan(*input.TableName, key); ok {
 		c.log("returning cached scan", key)
+		c.incHit()
 		return out.(*dynamodb.ScanOutput), nil
 	}
 
@@ -592,6 +628,7 @@ func (c *Cache) ScanWithContext(ctx aws.Context, input *dynamodb.ScanInput, opts
 		return out, err
 	}
 	c.log("caching scan", key)
+	c.incMiss()
 	c.setScan(*input.TableName, key, out)
 	return out, err
 }
@@ -619,35 +656,28 @@ func scanKey(input *dynamodb.ScanInput, schema []*dynamodb.KeySchemaElement) str
 }
 
 func exp2str(exp string, names map[string]*string, vals map[string]*dynamodb.AttributeValue) string {
+	pairs := make([]string, 0, len(names)*2+len(vals)*2)
 	for k, v := range names {
-		exp = strings.Replace(exp, k, *v, -1)
+		// exp = strings.Replace(exp, k, *v, -1)
+		pairs = append(pairs, k, *v)
 	}
 	for k, v := range vals {
-		exp = strings.Replace(exp, k, av2str(v), -1)
+		// exp = strings.Replace(exp, k, av2str(v), -1)
+		pairs = append(pairs, k, av2str(v))
 	}
-	return exp
+	replacer := strings.NewReplacer(pairs...)
+	return replacer.Replace(exp)
 }
 
-func cond2str(cond *dynamodb.Condition) string {
-	switch *cond.ComparisonOperator {
-	case dynamodb.ComparisonOperatorEq:
-		return "=" + av2str(cond.AttributeValueList[0])
-	case dynamodb.ComparisonOperatorNe:
-		return "!=" + av2str(cond.AttributeValueList[0])
-	case dynamodb.ComparisonOperatorLt:
-		return "<" + av2str(cond.AttributeValueList[0])
-	case dynamodb.ComparisonOperatorLe:
-		return "<=" + av2str(cond.AttributeValueList[0])
-	case dynamodb.ComparisonOperatorGt:
-		return ">" + av2str(cond.AttributeValueList[0])
-	case dynamodb.ComparisonOperatorGe:
-		return ">=" + av2str(cond.AttributeValueList[0])
-	case dynamodb.ComparisonOperatorBeginsWith:
-		return "bw(" + av2str(cond.AttributeValueList[0]) + ")"
-	case dynamodb.ComparisonOperatorBetween:
-		return av2str(cond.AttributeValueList[0]) + "~" + av2str(cond.AttributeValueList[1])
+func cond2str(str *strings.Builder, cond *dynamodb.Condition) {
+	str.WriteString(*cond.ComparisonOperator)
+	str.WriteByte(' ')
+	for i, av := range cond.AttributeValueList {
+		if i > 0 {
+			str.WriteByte('~')
+		}
+		fav2str(str, av)
 	}
-	panic("unknown cond " + *cond.ComparisonOperator)
 }
 
 type prefetcher struct {
@@ -736,11 +766,19 @@ func (c *Cache) desc(table string) (*dynamodb.DescribeTableOutput, error) {
 }
 
 func itemKey(table string, key map[string]*dynamodb.AttributeValue, schema []*dynamodb.KeySchemaElement) string {
-	if len(schema) == 1 {
-		return table + "$" + *schema[0].AttributeName + ":" + av2str(key[*schema[0].AttributeName])
+	var str strings.Builder
+	str.WriteString(table)
+	str.WriteByte('$')
+	str.WriteString(*schema[0].AttributeName)
+	str.WriteByte(':')
+	fav2str(&str, key[*schema[0].AttributeName])
+	if len(schema) > 1 {
+		str.WriteByte('/')
+		str.WriteString(*schema[1].AttributeName)
+		str.WriteByte(':')
+		fav2str(&str, key[*schema[1].AttributeName])
 	}
-	return table + "$" + *schema[0].AttributeName + ":" + av2str(key[*schema[0].AttributeName]) + "/" +
-		*schema[1].AttributeName + ":" + av2str(key[*schema[1].AttributeName])
+	return str.String()
 }
 
 func keyEq(a, b map[string]*dynamodb.AttributeValue) bool {
@@ -829,4 +867,55 @@ func av2str(av *dynamodb.AttributeValue) string {
 		return "NULL"
 	}
 	panic("unsupported av")
+}
+
+func fav2str(w *strings.Builder, av *dynamodb.AttributeValue) {
+	if av == nil {
+		w.WriteString("<nil>")
+	}
+	switch {
+	case av.B != nil:
+		w.Write(av.B)
+	case av.BS != nil:
+		w.WriteString(fmt.Sprint(av.BS))
+	case av.BOOL != nil:
+		if *av.BOOL {
+			w.WriteString("true")
+		}
+		w.WriteString("false")
+	case av.N != nil:
+		w.WriteString(*av.N)
+	case av.S != nil:
+		w.WriteString(*av.S)
+	case av.L != nil:
+		w.WriteString("L:")
+		for _, item := range av.L {
+			fav2str(w, item)
+			w.WriteByte(',')
+		}
+	case av.NS != nil:
+		w.WriteString("NS:")
+		for _, n := range av.NS {
+			w.WriteString(*n)
+			w.WriteByte(',')
+		}
+	case av.SS != nil:
+		w.WriteString("SS:")
+		for _, s := range av.SS {
+			w.WriteString(*s)
+			w.WriteByte(',')
+		}
+	case av.M != nil:
+		w.WriteString("M:")
+		for k, v := range av.M {
+			w.WriteString(k)
+			w.WriteByte('=')
+			fav2str(w, v)
+			w.WriteByte(',')
+		}
+	case av.NULL != nil:
+		w.WriteString("NULL")
+	default:
+		panic("unsupported av")
+	}
 }
