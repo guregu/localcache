@@ -138,8 +138,9 @@ func writeAV(w *strings.Builder, av *dynamodb.AttributeValue) {
 	case av.BOOL != nil:
 		if *av.BOOL {
 			w.WriteString("true")
+		} else {
+			w.WriteString("false")
 		}
-		w.WriteString("false")
 	case av.N != nil:
 		w.WriteString(*av.N)
 	case av.S != nil:
